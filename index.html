@@ -118,7 +118,7 @@
 </div>
  
 <script type="module">
-import { pipeline, RawImage, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.1";
+import { pipeline, RawImage, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
  
 // ============================================================
 // FIX #1 — run WASM inference in a Web Worker, off the main
@@ -127,6 +127,11 @@ import { pipeline, RawImage, env } from "https://cdn.jsdelivr.net/npm/@huggingfa
 // ("a problem repeatedly occurred").
 // ============================================================
 env.backends.onnx.wasm.proxy = true;
+ 
+// FIX #6 — force single-threaded WASM. ORT spawns pthread workers when it
+// believes threading is available; on iOS Safari those workers fail to load
+// ("no available backend found. ERR: [wasm] [object ErrorEvent]").
+env.backends.onnx.wasm.numThreads = 1;
  
 const cam      = document.getElementById("cam");
 const view     = document.getElementById("view");
