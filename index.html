@@ -159,7 +159,13 @@ for (let i = 0; i < 256; i++) {
   LUT[i * 3 + 2] = a[3] + (b[3] - a[3]) * f;
 }
 
-// --- Model load, WebGPU first
+// --- Model load
+// iOS Safari's WebGPU is unstable with this model (tab crashes with
+// "a problem repeatedly occurred"), so on iOS we force the WASM backend
+// with a compact 4-bit model to stay inside Safari's memory limits.
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 let estimator, backend = "wasm";
 async function loadModel() {
   const opts = {
@@ -168,7 +174,7 @@ async function loadModel() {
         barFill.style.width = `${Math.round((p.loaded / p.total) * 100)}%`;
     },
   };
-  if (navigator.gpu) {
+  if (!isIOS && navigator.gpu) {
     try {
       estimator = await pipeline("depth-estimation",
         "onnx-community/depth-anything-v2-small",
@@ -179,7 +185,7 @@ async function loadModel() {
   }
   estimator = await pipeline("depth-estimation",
     "onnx-community/depth-anything-v2-small",
-    { ...opts, device: "wasm", dtype: "q8" });
+    { ...opts, device: "wasm", dtype: isIOS ? "q4" : "q8" });
 }
 
 // --- Camera
@@ -196,7 +202,7 @@ async function startCamera() {
 // --- Inference loop
 const work = document.createElement("canvas");   // small frame sent to the model
 const wctx = work.getContext("2d", { willReadFrequently: true });
-const INFER_W = 384;
+const INFER_W = isIOS ? 256 : 384;
 
 let frames = 0, lastTick = performance.now();
 
@@ -223,7 +229,14 @@ async function loop() {
   const image = new RawImage(
     wctx.getImageData(0, 0, INFER_W, ih).data, INFER_W, ih, 4);
 
-  const { depth } = await estimator(image);   // grayscale RawImage, bright = near
+  let depth;
+  try {
+    ({ depth } = await estimator(image));   // grayscale RawImage, bright = near
+  } catch (e) {
+    // Show the color feed instead of dying if a frame fails
+    drawCover(cam, vw, vh);
+    return requestAnimationFrame(loop);
+  }
 
   // Colorize via LUT
   const out = new ImageData(depth.width, depth.height);
