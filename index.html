@@ -21,11 +21,11 @@
     color: var(--ink);
     display: grid; place-items: center;
   }
- 
+
   /* Live view fills the screen */
   #view { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
   video { display: none; }
- 
+
   /* Loading / status card */
   #status {
     position: fixed; inset: 0; display: grid; place-items: center;
@@ -48,7 +48,7 @@
     letter-spacing: 0.06em; color: var(--bg); background: var(--near);
     border: none; border-radius: 999px; cursor: pointer; display: none;
   }
- 
+
   /* HUD */
   .hud { position: fixed; z-index: 5; display: flex; gap: 8px; align-items: center; }
   #topHud { top: max(14px, env(safe-area-inset-top)); left: 14px; right: 14px; justify-content: space-between; }
@@ -58,7 +58,7 @@
     border-radius: 999px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
   }
   #fps b { color: var(--near); font-weight: 600; }
- 
+
   /* Legend: the palette itself, labeled */
   #legend {
     position: fixed; z-index: 5; right: 14px; top: 50%;
@@ -71,7 +71,7 @@
     background: linear-gradient(to bottom, var(--near), #00b3a4, var(--far));
     border: 1px solid var(--line);
   }
- 
+
   /* Mode switch */
   #modes {
     bottom: max(20px, env(safe-area-inset-bottom)); left: 50%;
@@ -89,10 +89,10 @@
 </style>
 </head>
 <body>
- 
+
 <canvas id="view"></canvas>
 <video id="cam" autoplay playsinline muted></video>
- 
+
 <div id="status">
   <div>
     <h1>Depth Camera</h1>
@@ -102,37 +102,27 @@
     <p id="crumb"></p>
   </div>
 </div>
- 
+
 <div class="hud" id="topHud">
   <span class="badge" id="fps">— <b>fps</b></span>
   <span class="badge" id="backend">…</span>
 </div>
- 
+
 <div id="legend" class="hidden">
   <span>NEAR</span><div class="ramp"></div><span>FAR</span>
 </div>
- 
+
 <div class="hud" id="modes">
   <button id="mDepth" class="on">Depth</button>
   <button id="mColor">Color</button>
 </div>
- 
+
 <script type="module">
-import { pipeline, RawImage, env } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.8.1";
- 
-// ============================================================
-// FIX #1 — run WASM inference in a Web Worker, off the main
-// thread. Synchronous main-thread inference starves the UI
-// thread, and iOS Safari's watchdog kills unresponsive pages
-// ("a problem repeatedly occurred").
-// ============================================================
-env.backends.onnx.wasm.proxy = true;
- 
-// FIX #6 — force single-threaded WASM. ORT spawns pthread workers when it
-// believes threading is available; on iOS Safari those workers fail to load
-// ("no available backend found. ERR: [wasm] [object ErrorEvent]").
-env.backends.onnx.wasm.numThreads = 1;
- 
+// Main thread = UI only. All ML runs in worker.js (same-origin module worker).
+// History: main-thread inference/init froze the UI and the iOS watchdog killed
+// the page; ORT's built-in cross-origin proxy worker fails to boot on iOS
+// Safari. A same-origin worker sidesteps both.
+
 const cam      = document.getElementById("cam");
 const view     = document.getElementById("view");
 const ctx      = view.getContext("2d");
@@ -146,20 +136,18 @@ const legend   = document.getElementById("legend");
 const mDepth   = document.getElementById("mDepth");
 const mColor   = document.getElementById("mColor");
 const crumbEl  = document.getElementById("crumb");
- 
-// ============================================================
-// FIX #2 — crash breadcrumbs. A tab crash wipes the console,
-// but localStorage survives. Every stage (and every second of
-// the loop) records a checkpoint; after a crash, the loading
-// card shows where the previous session died.
-// ============================================================
+
+// --- Crash breadcrumbs (localStorage survives a tab crash)
 const mark = (s) => { try { localStorage.setItem("crumb", s); } catch {} };
 const lastCrumb = (() => { try { return localStorage.getItem("crumb"); } catch { return null; } })();
 if (lastCrumb && lastCrumb !== "clean exit") {
   crumbEl.textContent = `previous session ended at: ${lastCrumb}`;
 }
 addEventListener("pagehide", () => mark("clean exit"));
- 
+
+const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent)
+  || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+
 let mode = "depth";
 mDepth.onclick = () => setMode("depth");
 mColor.onclick = () => setMode("color");
@@ -169,51 +157,66 @@ function setMode(m) {
   mColor.classList.toggle("on", m === "color");
   legend.classList.toggle("hidden", m !== "depth");
 }
- 
-// --- Colormap: far (deep blue) -> mid (teal) -> near (yellow), 256-entry LUT
-const LUT = new Uint8ClampedArray(256 * 3);
-const stops = [
-  [0.0,   0,  26, 128],   // far
-  [0.55,  0, 179, 164],   // mid
-  [1.0, 255, 204,   0],   // near
-];
-for (let i = 0; i < 256; i++) {
-  const t = i / 255;
-  let a = stops[0], b = stops[stops.length - 1];
-  for (let s = 0; s < stops.length - 1; s++)
-    if (t >= stops[s][0] && t <= stops[s + 1][0]) { a = stops[s]; b = stops[s + 1]; break; }
-  const f = (t - a[0]) / (b[0] - a[0] || 1);
-  LUT[i * 3]     = a[1] + (b[1] - a[1]) * f;
-  LUT[i * 3 + 1] = a[2] + (b[2] - a[2]) * f;
-  LUT[i * 3 + 2] = a[3] + (b[3] - a[3]) * f;
-}
- 
-// --- Model load
-const isIOS = /iPhone|iPad|iPod/.test(navigator.userAgent)
-  || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
- 
-let estimator, backend = "wasm";
-async function loadModel() {
-  const opts = {
-    progress_callback: (p) => {
-      if (p.status === "progress" && p.total)
-        barFill.style.width = `${Math.round((p.loaded / p.total) * 100)}%`;
-    },
-  };
-  if (!isIOS && navigator.gpu) {
-    try {
-      estimator = await pipeline("depth-estimation",
-        "onnx-community/depth-anything-v2-small",
-        { ...opts, device: "webgpu", dtype: "fp16" });
-      backend = "webgpu";
-      return;
-    } catch { /* fall through to wasm */ }
+
+// --- Worker
+const INFER_W     = isIOS ? 256 : 384;
+const THROTTLE_MS = isIOS ? 150 : 0;
+
+const capCanvas = document.createElement("canvas");
+const capCtx    = capCanvas.getContext("2d", { willReadFrequently: true });
+const depthCanvas = document.createElement("canvas");
+const depthCtx    = depthCanvas.getContext("2d");
+
+let out = null;               // reusable ImageData for worker results
+let haveDepth = false;
+let workerBusy = false;
+let lastDepthAt = 0;
+let frames = 0, totalFrames = 0, lastTick = performance.now();
+
+mark("starting worker");
+const worker = new Worker("./worker.js", { type: "module" });
+
+worker.onerror = (e) => {
+  const detail = e.message || "worker.js failed to start — is it committed next to index.html?";
+  mark(`worker error: ${detail}`);
+  msgEl.textContent = `Worker failed: ${detail}`;
+};
+
+worker.onmessage = (e) => {
+  const m = e.data;
+  if (m.type === "boot") {
+    mark("worker booted, loading model");
+  } else if (m.type === "progress") {
+    barFill.style.width = `${m.pct}%`;
+  } else if (m.type === "ready") {
+    mark("model loaded");
+    backendEl.textContent = (m.backend === "webgpu" ? "GPU" : "WASM \u00b7 worker") + " \u00b7 Depth Anything V2";
+    msgEl.textContent = "Model ready. The camera stays on this device \u2014 nothing is uploaded.";
+    barFill.style.width = "100%";
+    startBtn.style.display = "inline-block";
+  } else if (m.type === "error") {
+    mark(`model load error: ${m.message}`);
+    msgEl.textContent = `Model failed to load: ${m.message}`;
+  } else if (m.type === "depth") {
+    if (!out || out.width !== m.width || out.height !== m.height) {
+      out = new ImageData(m.width, m.height);
+      depthCanvas.width = m.width; depthCanvas.height = m.height;
+    }
+    out.data.set(new Uint8ClampedArray(m.buffer));
+    depthCtx.putImageData(out, 0, 0);
+    haveDepth = true;
+    workerBusy = false;
+    lastDepthAt = performance.now();
+    totalFrames++;
+    countFrame();
+  } else if (m.type === "frameError") {
+    mark(`frame error: ${m.message}`);
+    workerBusy = false;
   }
-  estimator = await pipeline("depth-estimation",
-    "onnx-community/depth-anything-v2-small",
-    { ...opts, device: "wasm", dtype: isIOS ? "q4" : "q8" });
-}
- 
+};
+
+worker.postMessage({ type: "load", dtype: isIOS ? "q4" : "q8", tryWebGPU: !isIOS });
+
 // --- Camera
 async function startCamera() {
   const stream = await navigator.mediaDevices.getUserMedia({
@@ -224,101 +227,47 @@ async function startCamera() {
   await new Promise((r) => (cam.onloadedmetadata = r));
   await cam.play();
 }
- 
-// ============================================================
-// FIX #3 — split into two loops:
-//   render():    rAF loop, cheap, only draws — never waits on the model
-//   inferLoop(): async, runs the model as fast as it can (with a
-//                breather on iOS), writes results to depthCanvas
-// The old code awaited inference inside the rAF loop, so the UI
-// was hostage to model latency.
-// ============================================================
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
- 
-const capCanvas = document.createElement("canvas");                 // camera frame in
-const capCtx    = capCanvas.getContext("2d", { willReadFrequently: true });
-const depthCanvas = document.createElement("canvas");               // colorized depth out
-const depthCtx    = depthCanvas.getContext("2d");
- 
-const INFER_W     = isIOS ? 256 : 384;
-const THROTTLE_MS = isIOS ? 150 : 0;   // breather between inferences on iOS
- 
-// FIX #4 — reusable output buffer instead of a new ImageData per frame
-let out = null;
-let haveDepth = false;
-let running = true;
-let totalFrames = 0, frames = 0, lastTick = performance.now();
- 
-async function inferLoop() {
-  mark("infer loop started");
-  while (running) {
-    if (mode !== "depth" || !cam.videoWidth) { await sleep(100); continue; }
- 
-    const vw = cam.videoWidth, vh = cam.videoHeight;
-    const ih = Math.round((INFER_W * vh) / vw);
-    if (capCanvas.width !== INFER_W || capCanvas.height !== ih) {
-      capCanvas.width = INFER_W; capCanvas.height = ih;
-    }
-    capCtx.drawImage(cam, 0, 0, INFER_W, ih);
- 
-    const image = new RawImage(
-      capCtx.getImageData(0, 0, INFER_W, ih).data, INFER_W, ih, 4);
- 
-    let depth;
-    try {
-      ({ depth } = await estimator(image));   // grayscale RawImage, bright = near
-    } catch (e) {
-      mark(`inference error: ${e && e.message}`);
-      await sleep(500);
-      continue;
-    }
- 
-    if (!out || out.width !== depth.width || out.height !== depth.height) {
-      out = new ImageData(depth.width, depth.height);
-      depthCanvas.width  = depth.width;
-      depthCanvas.height = depth.height;
-      for (let i = 3; i < out.data.length; i += 4) out.data[i] = 255; // alpha once
-    }
- 
-    const d = depth.data, o = out.data;
-    for (let i = 0, n = d.length; i < n; i++) {
-      const v = d[i] * 3;
-      o[i * 4]     = LUT[v];
-      o[i * 4 + 1] = LUT[v + 1];
-      o[i * 4 + 2] = LUT[v + 2];
-    }
-    depthCtx.putImageData(out, 0, 0);
-    haveDepth = true;
- 
-    totalFrames++;
-    countFrame();
- 
-    if (THROTTLE_MS) await sleep(THROTTLE_MS);
-    else await sleep(0);   // always yield, even on fast machines
+
+// --- Frame pump: send a frame whenever the worker is idle (plus iOS breather)
+function pumpFrame() {
+  if (workerBusy || mode !== "depth" || !cam.videoWidth) return;
+  if (performance.now() - lastDepthAt < THROTTLE_MS) return;
+
+  const vw = cam.videoWidth, vh = cam.videoHeight;
+  const ih = Math.round((INFER_W * vh) / vw);
+  if (capCanvas.width !== INFER_W || capCanvas.height !== ih) {
+    capCanvas.width = INFER_W; capCanvas.height = ih;
   }
+  capCtx.drawImage(cam, 0, 0, INFER_W, ih);
+  const img = capCtx.getImageData(0, 0, INFER_W, ih);
+
+  workerBusy = true;
+  worker.postMessage(
+    { type: "frame", buffer: img.data.buffer, width: INFER_W, height: ih },
+    [img.data.buffer]);
 }
- 
+
+// --- Render loop: cheap, draw-only, never waits on the model
 function render() {
-  // FIX #5 — cap devicePixelRatio at 2. At dpr 3 the old canvas was
-  // ~27MP of framebuffer for content that is 256 px wide anyway.
   const dpr = Math.min(devicePixelRatio || 1, 2);
   const W = Math.round(innerWidth * dpr), H = Math.round(innerHeight * dpr);
   if (view.width !== W || view.height !== H) { view.width = W; view.height = H; }
- 
+
   if (mode === "color" || !haveDepth) {
     if (cam.videoWidth) drawCover(cam, cam.videoWidth, cam.videoHeight);
   } else {
     drawCover(depthCanvas, depthCanvas.width, depthCanvas.height);
   }
+  pumpFrame();
   requestAnimationFrame(render);
 }
- 
+
 function drawCover(src, sw, sh) {
   const scale = Math.max(view.width / sw, view.height / sh);
   const dw = sw * scale, dh = sh * scale;
   ctx.drawImage(src, (view.width - dw) / 2, (view.height - dh) / 2, dw, dh);
 }
- 
+
 function countFrame() {
   frames++;
   const now = performance.now();
@@ -328,50 +277,23 @@ function countFrame() {
     frames = 0; lastTick = now;
   }
 }
- 
-// --- Boot
-(async () => {
+
+// --- Boot (model loads in the worker; button appears on "ready")
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
   try {
-    mark("loading model (worker proxy)");
-    try {
-      await loadModel();
-    } catch (e1) {
-      // Safari often refuses ORT's cross-origin worker. Retry on the main
-      // thread; the inference throttle keeps the watchdog satisfied.
-      mark(`proxy load failed: ${e1 && (e1.message || e1)}`);
-      env.backends.onnx.wasm.proxy = false;
-      msgEl.textContent = "Retrying without worker\u2026";
-      barFill.style.width = "0%";
-      await loadModel();
-      backend += " \u00b7 main thread";
-    }
-    mark("model loaded");
-    backendEl.textContent = backend === "webgpu" ? "GPU · Depth Anything V2" : "WASM · Depth Anything V2";
-    msgEl.textContent = "Model ready. The camera stays on this device — nothing is uploaded.";
-    barFill.style.width = "100%";
-    startBtn.style.display = "inline-block";
-    startBtn.onclick = async () => {
-      startBtn.disabled = true;
-      try {
-        mark("starting camera");
-        await startCamera();
-        mark("camera started");
-        statusEl.remove();
-        setMode("depth");
-        render();
-        inferLoop();
-      } catch (e) {
-        mark(`camera error: ${e && e.message}`);
-        msgEl.textContent = "Camera blocked. Allow camera access and make sure the page is served over HTTPS, then reload.";
-        startBtn.disabled = false;
-      }
-    };
+    mark("starting camera");
+    await startCamera();
+    mark("camera started");
+    statusEl.remove();
+    setMode("depth");
+    render();
   } catch (e) {
-    const detail = (e && (e.message || String(e))) || "unknown error";
-    mark(`model load error: ${detail}`);
-    msgEl.textContent = `Model failed to load: ${detail}`;
+    mark(`camera error: ${e && e.message}`);
+    msgEl.textContent = "Camera blocked. Allow camera access and make sure the page is served over HTTPS, then reload.";
+    startBtn.disabled = false;
   }
-})();
+};
 </script>
 </body>
 </html>
