@@ -327,8 +327,19 @@ function countFrame() {
 // --- Boot
 (async () => {
   try {
-    mark("loading model");
-    await loadModel();
+    mark("loading model (worker proxy)");
+    try {
+      await loadModel();
+    } catch (e1) {
+      // Safari often refuses ORT's cross-origin worker. Retry on the main
+      // thread; the inference throttle keeps the watchdog satisfied.
+      mark(`proxy load failed: ${e1 && (e1.message || e1)}`);
+      env.backends.onnx.wasm.proxy = false;
+      msgEl.textContent = "Retrying without worker\u2026";
+      barFill.style.width = "0%";
+      await loadModel();
+      backend += " \u00b7 main thread";
+    }
     mark("model loaded");
     backendEl.textContent = backend === "webgpu" ? "GPU · Depth Anything V2" : "WASM · Depth Anything V2";
     msgEl.textContent = "Model ready. The camera stays on this device — nothing is uploaded.";
@@ -351,8 +362,9 @@ function countFrame() {
       }
     };
   } catch (e) {
-    mark(`model load error: ${e && e.message}`);
-    msgEl.textContent = "Model failed to load — check your connection and reload.";
+    const detail = (e && (e.message || String(e))) || "unknown error";
+    mark(`model load error: ${detail}`);
+    msgEl.textContent = `Model failed to load: ${detail}`;
   }
 })();
 </script>
