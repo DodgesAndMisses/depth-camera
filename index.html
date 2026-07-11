@@ -208,14 +208,24 @@ worker.onmessage = (e) => {
     workerBusy = false;
     lastDepthAt = performance.now();
     totalFrames++;
-    countFrame();
+    if (m.ms > 1500) {
+      fpsEl.innerHTML = `${(m.ms / 1000).toFixed(1)}s <b>/frame</b>`;
+      mark(`running ok, ${(m.ms / 1000).toFixed(1)}s/frame, frame ${totalFrames}`);
+    } else {
+      countFrame();
+    }
   } else if (m.type === "frameError") {
     mark(`frame error: ${m.message}`);
     workerBusy = false;
   }
 };
 
-worker.postMessage({ type: "load", dtype: isIOS ? "q4" : "q8", tryWebGPU: !isIOS });
+worker.postMessage({
+  type: "load",
+  dtype: isIOS ? "q4" : "q8",
+  tryWebGPU: !isIOS,
+  inferSize: isIOS ? 252 : 378,   // model's internal resolution (multiple of 14)
+});
 
 // --- Camera
 async function startCamera() {
