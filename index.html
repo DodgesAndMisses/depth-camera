@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, user-scalable=no">
+<title>Depth Camera</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --ink: #e8ecf4;
+    --dim: #7b8494;
+    --near: #ffcc00;   /* matches the iOS app's near color */
+    --far: #001a80;
+    --pill: rgba(20, 24, 34, 0.78);
+    --line: rgba(232, 236, 244, 0.14);
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; overflow: hidden; background: var(--bg); }
+  body {
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, monospace;
+    color: var(--ink);
+    display: grid; place-items: center;
+  }
+
+  /* Live view fills the screen */
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  video { display: none; }
+
+  /* Loading / status card */
+  #status {
+    position: fixed; inset: 0; display: grid; place-items: center;
+    background: var(--bg); z-index: 10; text-align: center; padding: 24px;
+  }
+  #status h1 { font-size: 15px; font-weight: 600; letter-spacing: 0.08em; text-transform: uppercase; }
+  #status p  { font-size: 12px; color: var(--dim); margin-top: 10px; line-height: 1.6; max-width: 34ch; }
+  #bar {
+    width: min(260px, 70vw); height: 3px; margin: 18px auto 0;
+    background: var(--line); border-radius: 2px; overflow: hidden;
+  }
+  #bar i {
+    display: block; height: 100%; width: 0%;
+    background: linear-gradient(90deg, var(--far), var(--near));
+    transition: width 0.2s;
+  }
+  #startBtn {
+    margin-top: 22px; padding: 12px 26px; font: inherit; font-size: 13px;
+    letter-spacing: 0.06em; color: var(--bg); background: var(--near);
+    border: none; border-radius: 999px; cursor: pointer; display: none;
+  }
+
+  /* HUD */
+  .hud { position: fixed; z-index: 5; display: flex; gap: 8px; align-items: center; }
+  #topHud { top: max(14px, env(safe-area-inset-top)); left: 14px; right: 14px; justify-content: space-between; }
+  .badge {
+    padding: 6px 12px; font-size: 11px; letter-spacing: 0.05em;
+    background: var(--pill); border: 1px solid var(--line);
+    border-radius: 999px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  #fps b { color: var(--near); font-weight: 600; }
+
+  /* Legend: the palette itself, labeled */
+  #legend {
+    position: fixed; z-index: 5; right: 14px; top: 50%;
+    transform: translateY(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 6px;
+    font-size: 10px; color: var(--ink); letter-spacing: 0.08em;
+  }
+  #legend .ramp {
+    width: 6px; height: 120px; border-radius: 3px;
+    background: linear-gradient(to bottom, var(--near), #00b3a4, var(--far));
+    border: 1px solid var(--line);
+  }
+
+  /* Mode switch */
+  #modes {
+    bottom: max(20px, env(safe-area-inset-bottom)); left: 50%;
+    transform: translateX(-50%);
+    background: var(--pill); border: 1px solid var(--line); border-radius: 999px;
+    padding: 4px; backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+  }
+  #modes button {
+    font: inherit; font-size: 12px; letter-spacing: 0.05em;
+    padding: 9px 20px; border: none; border-radius: 999px;
+    background: transparent; color: var(--dim); cursor: pointer;
+  }
+  #modes button.on { background: var(--ink); color: var(--bg); }
+  .hidden { display: none !important; }
+</style>
+</head>
+<body>
+
+<canvas id="view"></canvas>
+<video id="cam" autoplay playsinline muted></video>
+
+<div id="status">
+  <div>
+    <h1>Depth Camera</h1>
+    <p id="statusMsg">Loading depth model…</p>
+    <div id="bar"><i id="barFill"></i></div>
+    <button id="startBtn">Start camera</button>
+  </div>
+</div>
+
+<div class="hud" id="topHud">
+  <span class="badge" id="fps">— <b>fps</b></span>
+  <span class="badge" id="backend">…</span>
+</div>
+
+<div id="legend" class="hidden">
+  <span>NEAR</span><div class="ramp"></div><span>FAR</span>
+</div>
+
+<div class="hud" id="modes">
+  <button id="mDepth" class="on">Depth</button>
+  <button id="mColor">Color</button>
+</div>
+
+<script type="module">
+import { pipeline, RawImage } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.3.1";
+
+const cam      = document.getElementById("cam");
+const view     = document.getElementById("view");
+const ctx      = view.getContext("2d");
+const statusEl = document.getElementById("status");
+const msgEl    = document.getElementById("statusMsg");
+const barFill  = document.getElementById("barFill");
+const startBtn = document.getElementById("startBtn");
+const fpsEl    = document.getElementById("fps");
+const backendEl= document.getElementById("backend");
+const legend   = document.getElementById("legend");
+const mDepth   = document.getElementById("mDepth");
+const mColor   = document.getElementById("mColor");
+
+let mode = "depth";
+mDepth.onclick = () => setMode("depth");
+mColor.onclick = () => setMode("color");
+function setMode(m) {
+  mode = m;
+  mDepth.classList.toggle("on", m === "depth");
+  mColor.classList.toggle("on", m === "color");
+  legend.classList.toggle("hidden", m !== "depth");
+}
+
+// --- Colormap: far (deep blue) -> mid (teal) -> near (yellow), 256-entry LUT
+const LUT = new Uint8ClampedArray(256 * 3);
+const stops = [
+  [0.0,   0,  26, 128],   // far
+  [0.55,  0, 179, 164],   // mid
+  [1.0, 255, 204,   0],   // near
+];
+for (let i = 0; i < 256; i++) {
+  const t = i / 255;
+  let a = stops[0], b = stops[stops.length - 1];
+  for (let s = 0; s < stops.length - 1; s++)
+    if (t >= stops[s][0] && t <= stops[s + 1][0]) { a = stops[s]; b = stops[s + 1]; break; }
+  const f = (t - a[0]) / (b[0] - a[0] || 1);
+  LUT[i * 3]     = a[1] + (b[1] - a[1]) * f;
+  LUT[i * 3 + 1] = a[2] + (b[2] - a[2]) * f;
+  LUT[i * 3 + 2] = a[3] + (b[3] - a[3]) * f;
+}
+
+// --- Model load, WebGPU first
+let estimator, backend = "wasm";
+async function loadModel() {
+  const opts = {
+    progress_callback: (p) => {
+      if (p.status === "progress" && p.total)
+        barFill.style.width = `${Math.round((p.loaded / p.total) * 100)}%`;
+    },
+  };
+  if (navigator.gpu) {
+    try {
+      estimator = await pipeline("depth-estimation",
+        "onnx-community/depth-anything-v2-small",
+        { ...opts, device: "webgpu", dtype: "fp16" });
+      backend = "webgpu";
+      return;
+    } catch { /* fall through to wasm */ }
+  }
+  estimator = await pipeline("depth-estimation",
+    "onnx-community/depth-anything-v2-small",
+    { ...opts, device: "wasm", dtype: "q8" });
+}
+
+// --- Camera
+async function startCamera() {
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: "environment", width: { ideal: 1280 } },
+    audio: false,
+  });
+  cam.srcObject = stream;
+  await new Promise((r) => (cam.onloadedmetadata = r));
+  await cam.play();
+}
+
+// --- Inference loop
+const work = document.createElement("canvas");   // small frame sent to the model
+const wctx = work.getContext("2d", { willReadFrequently: true });
+const INFER_W = 384;
+
+let frames = 0, lastTick = performance.now();
+
+async function loop() {
+  const vw = cam.videoWidth, vh = cam.videoHeight;
+  if (!vw) return requestAnimationFrame(loop);
+
+  if (view.width !== innerWidth * devicePixelRatio) {
+    view.width  = innerWidth  * devicePixelRatio;
+    view.height = innerHeight * devicePixelRatio;
+  }
+
+  if (mode === "color") {
+    drawCover(cam, vw, vh);
+    countFrame();
+    return requestAnimationFrame(loop);
+  }
+
+  // Downscale frame for the model
+  const ih = Math.round((INFER_W * vh) / vw);
+  work.width = INFER_W; work.height = ih;
+  wctx.drawImage(cam, 0, 0, INFER_W, ih);
+
+  const image = new RawImage(
+    wctx.getImageData(0, 0, INFER_W, ih).data, INFER_W, ih, 4);
+
+  const { depth } = await estimator(image);   // grayscale RawImage, bright = near
+
+  // Colorize via LUT
+  const out = new ImageData(depth.width, depth.height);
+  for (let i = 0, n = depth.data.length; i < n; i++) {
+    const v = depth.data[i];
+    out.data[i * 4]     = LUT[v * 3];
+    out.data[i * 4 + 1] = LUT[v * 3 + 1];
+    out.data[i * 4 + 2] = LUT[v * 3 + 2];
+    out.data[i * 4 + 3] = 255;
+  }
+  work.width = depth.width; work.height = depth.height;
+  wctx.putImageData(out, 0, 0);
+  drawCover(work, depth.width, depth.height);
+
+  countFrame();
+  requestAnimationFrame(loop);
+}
+
+function drawCover(src, sw, sh) {
+  const scale = Math.max(view.width / sw, view.height / sh);
+  const dw = sw * scale, dh = sh * scale;
+  ctx.drawImage(src, (view.width - dw) / 2, (view.height - dh) / 2, dw, dh);
+}
+
+function countFrame() {
+  frames++;
+  const now = performance.now();
+  if (now - lastTick >= 1000) {
+    fpsEl.innerHTML = `${frames} <b>fps</b>`;
+    frames = 0; lastTick = now;
+  }
+}
+
+// --- Boot
+(async () => {
+  try {
+    await loadModel();
+    backendEl.textContent = backend === "webgpu" ? "GPU · Depth Anything V2" : "WASM · Depth Anything V2";
+    msgEl.textContent = "Model ready. The camera stays on this device — nothing is uploaded.";
+    barFill.style.width = "100%";
+    startBtn.style.display = "inline-block";
+    startBtn.onclick = async () => {
+      startBtn.disabled = true;
+      try {
+        await startCamera();
+        statusEl.remove();
+        setMode("depth");
+        loop();
+      } catch (e) {
+        msgEl.textContent = "Camera blocked. Allow camera access and make sure the page is served over HTTPS, then reload.";
+        startBtn.disabled = false;
+      }
+    };
+  } catch (e) {
+    msgEl.textContent = "Model failed to load — check your connection and reload.";
+  }
+})();
+</script>
+</body>
+</html>
